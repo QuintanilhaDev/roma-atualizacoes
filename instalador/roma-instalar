@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# Instalador do Roma.
+# Disco inteiro criptografado (LUKS2), btrfs com pontos de restauração (snapper),
+# kernel linux-zen, Plasma com a identidade do Roma e drivers escolhidos pelo roma-gpu.
+set -euo pipefail
+
+LOG=/tmp/roma-instalar.log
+MNT=/mnt
+TITULO="Instalador do Roma"
+exec 3>&1
+
+# ------------------------------------------------------------------ interface
+caixa()   { dialog --backtitle "$TITULO" "$@" 2>&1 1>&3; }
+msg()     { dialog --backtitle "$TITULO" --title "$1" --msgbox "$2" 12 70; }
+etapa()   { echo -e "\n>>> $*" | tee -a "$LOG"; }
+falhar()  {
+  dialog --backtitle "$TITULO" --title "A instalação falhou" --msgbox \
+    "$1\n\nO registro completo está em $LOG.\nNada foi alterado além do disco escolhido." 14 70 || true
+  exit 1
+}
+trap 'falhar "Erro inesperado na linha $LINENO."' ERR
+
+senha_dupla() { # $1 = título; ecoa a senha
+  local a b
+  while true; do
+    a=$(caixa --title "$1" --insecure --passwordbox "Digite a senha:" 9 60) || exit 1
+    b=$(caixa --title "$1" --insecure --passwordbox "Repita a senha:" 9 60) || exit 1
+    if [[ -z "$a" ]]; then msg "$1" "A senha não pode ficar vazia."; continue; fi
+    if [[ "$a" != "$b" ]]; then msg "$1" "As senhas não conferem. Tente de novo."; continue; fi
+    printf '%s' "$a"; return
+  done
+}
+
+# ------------------------------------------------------------------ verificações
+[[ $EUID -eq 0 ]] || { echo "Execute como administrador: sudo roma-instalar"; exit 1; }
+# Restos de uma tentativa anterior que falhou (disco montado ou destravado).
+# (o gpg-agent iniciado dentro do disco novo não leva "/mnt" no nome: encerra pelo nome)
+pkill -x gpg-agent 2>/dev/null || true
+pkill -x dirmngr 2>/dev/null || true
+sleep 1
+umount -R "$MNT" 2>/dev/null || umount -R -l "$MNT" 2>/dev/null || true
+cryptsetup close roma 2>/dev/null || true
+[[ -d /sys/firmware/efi ]] || falhar "Este computador iniciou o pendrive em modo BIOS/Legacy.\nO Roma precisa do modo UEFI: reinicie, entre na configuração da placa-mãe e ative o UEFI."
+: > "$LOG"
+
+msg "Bem-vindo ao Roma" "Este assistente instala o Roma no seu computador.\n\n• O disco escolhido será APAGADO por completo.\n• Tudo ficará criptografado: sem a senha, ninguém lê seus dados.\n• É preciso estar conectado à internet."
+
+if ! curl -fsSI --max-time 10 https://archlinux.org >/dev/null 2>&1; then
+  falhar "Sem conexão com a internet.\nConecte pelo ícone de rede no canto da tela e abra o instalador de novo."
+fi
+
+# ------------------------------------------------------------------ escolhas
+mapfile -t discos < <(lsblk -dpno NAME,TYPE | awk '$2=="disk"{print $1}' | grep -vE '^/dev/(loop|sr|zram)' || true)
+live_disco=$(lsblk -no PKNAME "$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null)" 2>/dev/null || true)
+opcoes=()
+for dev in "${discos[@]}"; do
+  [[ -n "$live_disco" && "$dev" == "/dev/$live_disco" ]] && continue   # não oferece o próprio pendrive
+  desc=$(lsblk -dno SIZE,MODEL "$dev" | xargs)
+  opcoes+=("$dev" "$desc")
+done
+(( ${#opcoes[@]} )) || falhar "Nenhum disco disponível para instalar."
+
+DISCO=$(caixa --title "Disco" --menu "Em qual disco instalar o Roma?\nTODO o conteúdo dele será apagado." 16 72 6 "${opcoes[@]}") || exit 1
+
+NOME=$(caixa --title "Seu usuário" --inputbox "Seu nome (como aparece na tela):" 9 60) || exit 1
+NOME=$(tr -d "'\"\\\\:" <<<"$NOME")   # remove aspas, barras e dois-pontos
+USUARIO=$(caixa --title "Seu usuário" --inputbox "Nome de login (letras minúsculas, sem espaço):" 9 60 \
+          "$(tr '[:upper:]' '[:lower:]' <<<"${NOME%% *}" | iconv -f utf8 -t ascii//TRANSLIT | tr -cd 'a-z0-9_-')") || exit 1
+[[ "$USUARIO" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || falhar "Nome de login inválido: use letras minúsculas, números, - ou _."
+MAQUINA=$(caixa --title "Computador" --inputbox "Nome deste computador na rede:" 9 60 "roma") || exit 1
+[[ "$MAQUINA" =~ ^[a-zA-Z0-9-]{1,63}$ ]] || falhar "Nome do computador inválido."
+
+# Instalação anterior incompleta neste disco? Dá para continuar sem baixar tudo de novo.
+RETOMAR=0
+part_roma=$(lsblk -pnlo NAME,PARTLABEL,FSTYPE "$DISCO" | awk '$2=="ROMA" && $3=="crypto_LUKS"{print $1}' | head -1)
+part_efi=$(lsblk -pnlo NAME,PARTLABEL "$DISCO" | awk '$2=="ROMA_EFI"{print $1}' | head -1)
+if [[ -n "$part_roma" && -n "$part_efi" ]] && caixa --title "Instalação anterior encontrada" \
+     --yes-label "Continuar" --no-label "Apagar e recomeçar" --yesno \
+     "Este disco tem uma instalação do Roma que não terminou.\n\nContinuar de onde parou aproveita os pacotes já baixados (bem mais rápido). Para isso, digite a senha do disco usada na tentativa anterior." 12 70; then
+  while true; do
+    SENHA_DISCO=$(caixa --title "Senha do disco" --insecure --passwordbox "Senha do disco da tentativa anterior:" 9 60) || exit 1
+    if printf '%s' "$SENHA_DISCO" | cryptsetup open --test-passphrase --key-file=- "$part_roma" 2>/dev/null; then
+      RETOMAR=1; break
+    fi
+    msg "Senha do disco" "Senha incorreta. Tente de novo (ou cancele e escolha Apagar e recomeçar)."
+  done
+fi
+
+SENHA_USUARIO=$(senha_dupla "Senha do usuário")
+if (( RETOMAR )); then
+  :   # a senha do disco é a da tentativa anterior
+elif caixa --title "Criptografia" --yesno "Usar a MESMA senha para destravar o disco ao ligar o computador?\n\n(Escolha Não para definir uma senha diferente para o disco.)" 10 64; then
+  SENHA_DISCO="$SENHA_USUARIO"
+else
+  SENHA_DISCO=$(senha_dupla "Senha do disco")
+fi
+
+caixa --title "Confirmação final" --yes-label "Apagar e instalar" --no-label "Cancelar" --yesno \
+  "Disco: $DISCO ($(lsblk -dno SIZE "$DISCO"))\nUsuário: $USUARIO\nComputador: $MAQUINA\n\n$( (( RETOMAR )) && echo 'A instalação anterior será concluída.' || echo "TODOS os dados de $DISCO serão apagados.") Continuar?" 12 64 || exit 1
+
+# ------------------------------------------------------------------ servidores
+# O pendrive escolhe servidores pela velocidade medida no boot, o que às vezes cai em
+# servidores do outro lado do mundo. O Roma usa servidores do Brasil e dos EUA, mais a
+# rede de distribuição oficial do Arch como reserva.
+SERVIDORES_RESERVA=(
+  'https://geo.mirror.pkgbuild.com/$repo/os/$arch'
+  'https://archlinux.c3sl.ufpr.br/$repo/os/$arch'
+  'https://mirror.ufscar.br/archlinux/$repo/os/$arch'
+  'https://fastly.mirror.pkgbuild.com/$repo/os/$arch'
+)
+escolher_servidores() {
+  local lista=/etc/pacman.d/mirrorlist novo
+  novo=$(mktemp)
+  etapa "Escolhendo servidores de download próximos"
+  if command -v reflector >/dev/null && \
+     reflector --country BR,US --protocol https --age 12 --latest 25 --fastest 8 \
+               --download-timeout 8 --save "$novo" 2>/dev/null && grep -q '^Server' "$novo"; then
+    :
+  else
+    : > "$novo"
+  fi
+  # Na segunda tentativa, a reserva oficial vai na frente.
+  # (grep sem resultado não pode interromper a instalação: o reflector pode falhar em conexão lenta)
+  if [[ "${1:-}" == "outra" ]]; then
+    { printf 'Server = %s\n' "${SERVIDORES_RESERVA[@]}"; grep '^Server' "$novo" || true; } > "$lista"
+  else
+    { grep '^Server' "$novo" || true; printf 'Server = %s\n' "${SERVIDORES_RESERVA[@]}"; } > "$lista"
+  fi
+  rm -f "$novo"
+  head -4 "$lista" || true
+}
+
+# ------------------------------------------------------------------ disco
+# Solta tudo o que estiver usando o disco escolhido: partições montadas (o gerenciador de
+# arquivos monta sozinho ao abrir um disco), swap, disco criptografado ou LVM de uma
+# instalação anterior.
+liberar_disco() {
+  local disco="$1" dev tipo
+  # Uma tentativa anterior pode ter deixado o gpg-agent/dirmngr (do chaveiro do pacman)
+  # rodando dentro de $MNT, o que prende a montagem e o disco.
+  pkill -x gpg-agent 2>/dev/null || true
+  pkill -x dirmngr 2>/dev/null || true
+  sleep 1
+  # Só quando $MNT é mesmo um ponto de montagem: sem isso, "fuser -m" pegaria o sistema do
+  # pendrive inteiro e encerraria a sessão (parecia que o computador tinha reiniciado).
+  if mountpoint -q "$MNT"; then
+    fuser -km "$MNT" 2>/dev/null || true
+  fi
+  umount -R "$MNT" 2>/dev/null || umount -R -l "$MNT" 2>/dev/null || true
+  # Do mais interno para o mais externo (ex.: LVM dentro de LUKS dentro da partição).
+  while read -r dev tipo; do
+    [[ "$dev" == "$disco" ]] && continue
+    swapoff "$dev" 2>/dev/null || true
+    umount -l "$dev" 2>/dev/null || true
+    case "$tipo" in
+      crypt) cryptsetup close "$dev" 2>/dev/null || dmsetup remove --force "$dev" 2>/dev/null || true ;;
+      lvm)   dmsetup remove --force "$dev" 2>/dev/null || true ;;
+      raid*) mdadm --stop "$dev" 2>/dev/null || true ;;
+    esac
+  done < <(lsblk -pnlo NAME,TYPE "$disco" | tac)
+  command -v vgchange >/dev/null && vgchange -an >/dev/null 2>&1 || true
+  udevadm settle
+  if lsblk -pnlo NAME,MOUNTPOINTS "$disco" | awk 'NF > 1' | grep -q .; then
+    echo "Alguma partição de $disco continua em uso:"; lsblk "$disco"
+    return 1
+  fi
+}
+
+reler_particoes() {
+  local disco="$1" i
+  for i in 1 2 3 4 5; do
+    partprobe "$disco" 2>/dev/null || blockdev --rereadpt "$disco" 2>/dev/null || partx -u "$disco" 2>/dev/null || true
+    udevadm settle
+    [[ $(lsblk -pnlo NAME,TYPE "$disco" | awk '$2=="part"' | wc -l) -eq 2 ]] && [[ -b "$(lsblk -pnlo NAME,TYPE "$disco" | awk '$2=="part"{print $1}' | tail -1)" ]] && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# ------------------------------------------------------------------ instalação
+instalar() {
+  set -euo pipefail
+  etapa "Preparando o gerenciador de pacotes"
+  sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' /etc/pacman.conf
+  sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf
+  escolher_servidores
+  local t
+  for t in 1 2 3; do
+    pacman -Sy --noconfirm --disable-download-timeout archlinux-keyring && break
+    (( t == 3 )) && return 1
+    echo ">>> Falha ao atualizar a lista de pacotes. Tentando de novo..."
+    escolher_servidores outra
+    sleep 5
+  done
+
+  etapa "Liberando $DISCO"
+  liberar_disco "$DISCO"
+
+  opts=noatime,compress=zstd:1,space_cache=v2
+  if (( RETOMAR )); then
+    etapa "Continuando a instalação anterior"
+    EFI="$part_efi"; RAIZ="$part_roma"
+    # Se o disco ainda estiver destravado da tentativa anterior, reaproveita.
+    if [[ -b /dev/mapper/roma ]] && cryptsetup status roma 2>/dev/null | grep -q "device:.*$RAIZ"; then
+      echo "O disco já estava destravado; continuando."
+    else
+      printf '%s' "$SENHA_DISCO" | cryptsetup open --key-file=- "$RAIZ" roma
+    fi
+    mount -o "$opts,subvol=@" /dev/mapper/roma "$MNT"
+    mkdir -p "$MNT"/{boot,home,.snapshots,var/log,var/cache/pacman/pkg}
+    mount -o "$opts,subvol=@home" /dev/mapper/roma "$MNT/home"
+    mount -o "$opts,subvol=@snapshots" /dev/mapper/roma "$MNT/.snapshots"
+    mount -o "$opts,subvol=@log" /dev/mapper/roma "$MNT/var/log"
+    mount -o "$opts,subvol=@cache" /dev/mapper/roma "$MNT/var/cache/pacman/pkg"
+    mount -o umask=0077 "$EFI" "$MNT/boot"
+  else
+
+  etapa "Particionando $DISCO"
+  wipefs -af "$DISCO"
+  sgdisk --zap-all "$DISCO"
+  sgdisk -n1:0:+1G -t1:ef00 -c1:ROMA_EFI -n2:0:0 -t2:8309 -c2:ROMA "$DISCO"
+  reler_particoes "$DISCO"
+  mapfile -t parts < <(lsblk -pnlo NAME,TYPE "$DISCO" | awk '$2=="part"{print $1}')
+  (( ${#parts[@]} == 2 )) || { echo "O sistema não reconheceu as partições novas de $DISCO."; return 1; }
+  EFI="${parts[0]}"; RAIZ="${parts[1]}"
+  wipefs -af "$EFI" "$RAIZ" >/dev/null
+
+  etapa "Criptografando o disco (LUKS2)"
+  printf '%s' "$SENHA_DISCO" | cryptsetup luksFormat --type luks2 --batch-mode --key-file=- "$RAIZ"
+  printf '%s' "$SENHA_DISCO" | cryptsetup open --key-file=- "$RAIZ" roma
+  mkfs.fat -F32 -n ROMA_EFI "$EFI"
+  mkfs.btrfs -f -L roma /dev/mapper/roma
+
+  etapa "Criando subvolumes btrfs"
+  mount /dev/mapper/roma "$MNT"
+  for sv in @ @home @snapshots @log @cache; do btrfs subvolume create "$MNT/$sv"; done
+  umount "$MNT"
+  mount -o "$opts,subvol=@" /dev/mapper/roma "$MNT"
+  mkdir -p "$MNT"/{boot,home,.snapshots,var/log,var/cache/pacman/pkg}
+  mount -o "$opts,subvol=@home" /dev/mapper/roma "$MNT/home"
+  mount -o "$opts,subvol=@snapshots" /dev/mapper/roma "$MNT/.snapshots"
+  mount -o "$opts,subvol=@log" /dev/mapper/roma "$MNT/var/log"
+  mount -o "$opts,subvol=@cache" /dev/mapper/roma "$MNT/var/cache/pacman/pkg"
+  mount -o umask=0077 "$EFI" "$MNT/boot"
+  fi
+
+  etapa "Instalando os pacotes (é a parte mais demorada)"
+  mapfile -t pacotes < <(grep -vE '^\s*(#|$)' /usr/share/roma/pacotes-sistema.txt)
+  read -ra drivers <<<"$(roma-gpu pacotes)"
+  # Até 3 tentativas: se um servidor falhar no meio, escolhe outros e continua de onde parou
+  # (os pacotes já baixados ficam no cache do disco novo).
+  local tentativa
+  for tentativa in 1 2 3; do
+    if pacstrap -K "$MNT" "${pacotes[@]}" "${drivers[@]}" --noconfirm --disable-download-timeout; then
+      break
+    fi
+    (( tentativa == 3 )) && return 1
+    echo ">>> Falha ao baixar alguns pacotes. Trocando de servidor e tentando de novo ($((tentativa + 1))/3)..."
+    rm -f "$MNT"/var/cache/pacman/pkg/*.part "$MNT"/var/cache/pacman/pkg/download-* 2>/dev/null || true
+    escolher_servidores outra
+    sleep 5
+  done
+  cp /etc/pacman.conf "$MNT/etc/pacman.conf"
+  genfstab -U "$MNT" > "$MNT/etc/fstab"
+
+  etapa "Instalando o Roma (Ars Studio, Roma Compat, visual e ajustes)"
+  # Os componentes do Roma vêm como pacote: assim chegam atualizados pelo próprio sistema depois.
+  pacote=$(ls /usr/share/roma/pacotes/roma-sistema-*.pkg.tar.zst | tail -1)
+  # Fica em /root: o arch-chroot monta um /tmp vazio por cima do /tmp do disco novo.
+  cp "$pacote" "$MNT/root/"
+  arch-chroot "$MNT" pacman -U --noconfirm "/root/$(basename "$pacote")"
+  rm -f "$MNT/root/$(basename "$pacote")"
+  # Menus do Ars Studio: a versão do PyQt acompanha a do motor de pintura.
+  pyqt=$(arch-chroot "$MNT" pacman -Si krita 2>/dev/null | grep -oE 'python-pyqt[0-9]+' | head -1 || true)
+  [[ -n "$pyqt" ]] && arch-chroot "$MNT" pacman -S --noconfirm --needed --asdeps "$pyqt"
+  mkdir -p "$MNT/etc/roma"; date -Iseconds > "$MNT/etc/roma/instalado"
+
+  etapa "Configurando o sistema"
+  local uuid; uuid=$(blkid -s UUID -o value "$RAIZ")
+  arch-chroot "$MNT" /bin/bash -euo pipefail <<CHROOT
+ln -sf /usr/share/zoneinfo/America/Sao_Paulo /etc/localtime
+hwclock --systohc || true
+sed -i 's/^#pt_BR.UTF-8/pt_BR.UTF-8/; s/^#en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
+locale-gen
+echo 'LANG=pt_BR.UTF-8' > /etc/locale.conf
+echo 'KEYMAP=br-abnt2' > /etc/vconsole.conf
+echo '$MAQUINA' > /etc/hostname
+printf '127.0.0.1 localhost\n::1 localhost\n127.0.1.1 $MAQUINA.localdomain $MAQUINA\n' > /etc/hosts
+
+# Initramfs com systemd e desbloqueio do disco criptografado.
+sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block sd-encrypt filesystems fsck)/' /etc/mkinitcpio.conf
+# Com driver NVIDIA, o hook kms carregaria o nouveau antes; a NVIDIA recomenda retirá-lo.
+if pacman -Q nvidia-open-dkms &>/dev/null; then
+  sed -i 's/ kms / /' /etc/mkinitcpio.conf
+  echo 'options nvidia NVreg_PreserveVideoMemoryAllocations=1' > /etc/modprobe.d/roma-nvidia.conf
+  systemctl enable nvidia-suspend.service nvidia-hibernate.service nvidia-resume.service
+fi
+mkinitcpio -P
+
+# Carregador de boot.
+bootctl install || bootctl update
+cat > /boot/loader/loader.conf <<EOF
+default roma.conf
+timeout 2
+console-mode max
+editor no
+EOF
+opcoes="rd.luks.name=$uuid=roma root=/dev/mapper/roma rootflags=subvol=@ rw quiet splash nvidia_drm.modeset=1"
+cat > /boot/loader/entries/roma.conf <<EOF
+title   Roma
+linux   /vmlinuz-linux-zen
+initrd  /initramfs-linux-zen.img
+options \$opcoes
+EOF
+cat > /boot/loader/entries/roma-recuperacao.conf <<EOF
+title   Roma (recuperação)
+linux   /vmlinuz-linux-zen
+initrd  /initramfs-linux-zen-fallback.img
+options \$opcoes
+EOF
+
+# Pontos de restauração (snapper) usando o subvolume @snapshots.
+if [ ! -f /etc/snapper/configs/root ]; then
+  umount /.snapshots
+  rm -rf /.snapshots
+  snapper --no-dbus -c root create-config /
+  btrfs subvolume delete /.snapshots
+  mkdir /.snapshots
+  mount -a
+  chmod 750 /.snapshots
+fi
+sed -i 's/^TIMELINE_LIMIT_HOURLY=.*/TIMELINE_LIMIT_HOURLY="5"/; s/^TIMELINE_LIMIT_DAILY=.*/TIMELINE_LIMIT_DAILY="7"/; s/^TIMELINE_LIMIT_MONTHLY=.*/TIMELINE_LIMIT_MONTHLY="0"/; s/^TIMELINE_LIMIT_YEARLY=.*/TIMELINE_LIMIT_YEARLY="0"/' /etc/snapper/configs/root
+
+# Usuário.
+id '$USUARIO' >/dev/null 2>&1 || useradd -m -G wheel,video,audio,input,gamemode -s /bin/bash -c '$NOME' '$USUARIO'
+echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-roma-wheel
+chmod 440 /etc/sudoers.d/10-roma-wheel
+passwd -l root
+
+# Login gráfico com o tema escuro e o layout do Roma.
+mkdir -p /etc/sddm.conf.d
+printf '[Theme]\nCurrent=breeze\n\n[General]\nNumlock=on\n' > /etc/sddm.conf.d/10-roma.conf
+
+# Firewall: bloqueia conexões de entrada não solicitadas.
+# (dentro do chroot o ufw pode não conseguir carregar as regras agora; elas valem no primeiro boot)
+ufw default deny incoming || true
+ufw default allow outgoing || true
+sed -i 's/^ENABLED=.*/ENABLED=yes/' /etc/ufw/ufw.conf
+ufw --force enable || true
+
+systemctl enable NetworkManager sddm bluetooth ufw fstrim.timer snapper-timeline.timer snapper-cleanup.timer systemd-timesyncd
+systemctl --global enable roma-atualizacoes.timer
+CHROOT
+  printf '%s:%s' "$USUARIO" "$SENHA_USUARIO" | arch-chroot "$MNT" chpasswd
+
+  # Dentro do chroot o bootctl não grava a entrada de boot na placa-mãe ("Not booted with EFI or
+  # running in a container"). Grava aqui, pelo sistema do pendrive, que iniciou em UEFI.
+  etapa "Registrando o Roma na placa-mãe"
+  if ! efibootmgr 2>/dev/null | grep -qE 'Roma|Linux Boot Manager'; then
+    local num_efi
+    num_efi=$(lsblk -no PARTN "$EFI" 2>/dev/null | tr -d ' ')
+    efibootmgr --create --disk "$DISCO" --part "${num_efi:-1}" --label "Roma" \
+      --loader '\EFI\systemd\systemd-bootx64.efi' >/dev/null || \
+      echo "Aviso: não foi possível registrar a entrada de boot; a placa-mãe ainda deve achar o Roma como 'UEFI OS'."
+  fi
+}
+
+# A falha de um passo é tratada aqui (com a mensagem certa), não pelo aviso de "erro inesperado".
+trap - ERR
+set +e
+instalar 2>&1 | tee -a "$LOG" | dialog --backtitle "$TITULO" --title "Instalando o Roma" --programbox 24 90
+resultado=${PIPESTATUS[0]}
+set -e
+trap 'falhar "Erro inesperado na linha $LINENO."' ERR
+(( resultado == 0 )) || falhar "Um passo da instalação não foi concluído (veja a última mensagem na tela anterior)."
+
+umount -R "$MNT" || true
+cryptsetup close roma || true
+
+if caixa --title "Roma instalado" --yes-label "Reiniciar agora" --no-label "Depois" --yesno \
+  "O Roma foi instalado com sucesso.\n\nRetire o pendrive e reinicie. Ao ligar, digite a senha do disco e depois entre com seu usuário." 11 64; then
+  reboot
+fi

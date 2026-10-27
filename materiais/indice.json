@@ -1,0 +1,53 @@
+{
+ "versao": 1,
+ "materiais": [
+  {
+   "id": "reticulas-roma",
+   "nome": "Retículas Roma",
+   "tipo": "reticulas",
+   "resumo": "Pontos a 45° de 10% a 80%, linhas, hachura e areia para mangá",
+   "arquivo": "reticulas-roma.bundle",
+   "sha256": "242f076ecc992ed33ee80f664a6eb9d0f9049a3ac9752081edcf675f0b2bb407",
+   "tamanho": 84234,
+   "previa": "reticulas-roma.png",
+   "versao": 1,
+   "itens": 13
+  },
+  {
+   "id": "papeis-e-texturas",
+   "nome": "Papéis e texturas",
+   "tipo": "texturas",
+   "resumo": "Papel aquarela, esboço, kraft, tela de pintura e superfície rugosa, sem emenda",
+   "arquivo": "papeis-e-texturas.bundle",
+   "sha256": "faf3c98ba26c966c76e95b1101c98e38e0bfa3cda9be37b9de900e45391d69bd",
+   "tamanho": 269688,
+   "previa": "papeis-e-texturas.png",
+   "versao": 1,
+   "itens": 5
+  },
+  {
+   "id": "pontas-de-efeitos",
+   "nome": "Pontas de efeitos",
+   "tipo": "pinceis",
+   "resumo": "Estrela, folha, nuvem, respingo, grama e brilho para carimbar e espalhar",
+   "arquivo": "pontas-de-efeitos.bundle",
+   "sha256": "f20816c395efbaedeb8d3fb7eefcc416538bc2504570c1d842ba74b8d9f32676",
+   "tamanho": 49128,
+   "previa": "pontas-de-efeitos.png",
+   "versao": 1,
+   "itens": 6
+  },
+  {
+   "id": "poses-extras",
+   "nome": "Poses extras",
+   "tipo": "poses",
+   "resumo": "Dez poses novas para o painel Pose 3D: acenando, agachado, chute alto e mais",
+   "arquivo": "poses-extras.json",
+   "sha256": "028a33398c7d3cb7bec189c59bbf44de3f78fa2de670cb3e338c843b0b14967a",
+   "tamanho": 3870,
+   "previa": "poses-extras.png",
+   "versao": 1,
+   "itens": 10
+  }
+ ]
+}
